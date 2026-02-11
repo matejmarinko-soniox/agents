@@ -47,6 +47,9 @@ KEEPALIVE_MESSAGE = '{"type": "keepalive"}'
 END_TOKEN = "<end>"
 FINALIZED_TOKEN = "<fin>"
 
+KEEPALIVE_INTERVAL = 5
+RECEIVE_TIMEOUT = 10
+
 
 def is_end_token(token: dict) -> bool:
     """Return True if the given token marks an end or finalized event."""
@@ -83,7 +86,7 @@ class ContextObject:
 class STTOptions:
     """Configuration options for Soniox Speech-to-Text service."""
 
-    model: str = "stt-rt-v3"
+    model: str = "stt-rt-v4"
 
     language_hints: list[str] | None = None
     language_hints_strict: bool = False
@@ -260,19 +263,21 @@ class SpeechStream(stt.SpeechStream):
                 ]
                 wait_reconnect_task = asyncio.create_task(self._reconnect_event.wait())
                 try:
+                    # Wait for any individual task to finish or for a reconnect request
                     done, _ = await asyncio.wait(
-                        [asyncio.gather(*tasks), wait_reconnect_task],
+                        tasks + [wait_reconnect_task],
                         return_when=asyncio.FIRST_COMPLETED,
                     )
 
-                    for task in done:
-                        if task != wait_reconnect_task:
-                            task.result()
+                    if wait_reconnect_task in done:
+                        self._reconnect_event.clear()
+                        logger.info("Reconnecting to Soniox Speech-to-Text API...")
+                        continue
 
-                    if wait_reconnect_task not in done:
-                        break
-
-                    self._reconnect_event.clear()
+                    # If we got here, one of the main tasks finished without a reconnect request
+                    # which usually means a normal shutdown or unrecoverable error
+                    logger.info("Soniox STT tasks completed.")
+                    break
                 finally:
                     await utils.aio.gracefully_cancel(*tasks, wait_reconnect_task)
             # Handle errors.
@@ -312,9 +317,10 @@ class SpeechStream(stt.SpeechStream):
         try:
             while self._ws:
                 await self._ws.send_str(KEEPALIVE_MESSAGE)
-                await asyncio.sleep(5)
+                await asyncio.sleep(KEEPALIVE_INTERVAL)
         except Exception as e:
             logger.error(f"Error while sending keep alive message: {e}")
+            self._reconnect_event.set()
 
     async def _prepare_audio_task(self):
         """Read audio frames and enqueue PCM data for sending."""
@@ -346,6 +352,7 @@ class SpeechStream(stt.SpeechStream):
                 break
             except Exception as e:
                 logger.error(f"Error while sending audio data: {e}")
+                self._reconnect_event.set()
                 break
 
     async def _recv_messages_task(self):
@@ -383,7 +390,8 @@ class SpeechStream(stt.SpeechStream):
         # Method handles receiving messages from the Soniox Speech-to-Text API.
         while self._ws:
             try:
-                async for msg in self._ws:
+                while self._ws:
+                    msg = await self._ws.receive(timeout=RECEIVE_TIMEOUT)
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         try:
                             content = json.loads(msg.data)
@@ -465,6 +473,7 @@ class SpeechStream(stt.SpeechStream):
                         aiohttp.WSMsgType.CLOSED,
                         aiohttp.WSMsgType.CLOSE,
                         aiohttp.WSMsgType.CLOSING,
+                        aiohttp.WSMsgType.ERROR,
                     ):
                         break
                     else:
@@ -473,5 +482,12 @@ class SpeechStream(stt.SpeechStream):
                         )
             except aiohttp.ClientError as e:
                 logger.error(f"WebSocket error while receiving: {e}")
+                self._reconnect_event.set()
+            except asyncio.TimeoutError as e:
+                logger.error(
+                    f"Timeout connecting to or initializing Soniox Speech-to-Text API session: {e}"
+                )
+                self._reconnect_event.set()
             except Exception as e:
                 logger.error(f"Unexpected error while receiving messages: {e}")
+                self._reconnect_event.set()
